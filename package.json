@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --check index.js && node --check logger.js && node --check leaveRejoin.js"
+    "test": "node --check index.js && node --check logger.js && node --check leaveRejoin.js && node --check serverStatus.js"
   },
   "engines": {
     "node": ">=22"

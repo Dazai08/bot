@@ -5,6 +5,7 @@ const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
 const config = require("./settings.json");
+const { pingServer, describeStatus, chatToText } = require("./serverStatus");
 const express = require("express");
 const http = require("http");
 const https = require("https");
@@ -1148,6 +1149,12 @@ let bot = null;
 let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
+let connectionHeartbeatId = null;
+let preflightRetryId = null;
+let preflightInProgress = false;
+let preflightFailures = 0;
+let preflightNotReadyCount = 0;
+let startupChecksDone = false;
 let isReconnecting = false;
 
 function clearBotTimeouts() {
@@ -1158,6 +1165,14 @@ function clearBotTimeouts() {
   if (connectionTimeoutId) {
     clearTimeout(connectionTimeoutId);
     connectionTimeoutId = null;
+  }
+  if (connectionHeartbeatId) {
+    clearInterval(connectionHeartbeatId);
+    connectionHeartbeatId = null;
+  }
+  if (preflightRetryId) {
+    clearTimeout(preflightRetryId);
+    preflightRetryId = null;
   }
 }
 
@@ -1198,7 +1213,115 @@ function getReconnectDelay() {
   return delay + jitter;
 }
 
-function createBot() {
+// ============================================================
+// STARTUP CHECKS + PRE-FLIGHT (server status ping)
+// Tells you WHY a join can't work instead of silently timing out.
+// ============================================================
+function botProtocolVersion() {
+  try {
+    const d = require("minecraft-data")(config.server.version);
+    return d && d.version ? d.version.version : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function runStartupChecks() {
+  if (startupChecksDone) return;
+  startupChecksDone = true;
+
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  if (nodeMajor < 22) {
+    addLog(
+      `[Startup] WARNING: Node ${process.versions.node} - mineflayer 4.39 needs Node 22 or newer. Update the Node version of your host.`,
+    );
+  }
+  try {
+    const mf = require("mineflayer/package.json").version;
+    const md = require("minecraft-data/package.json").version;
+    addLog(`[Startup] mineflayer ${mf}, minecraft-data ${md}, node ${process.versions.node}`);
+  } catch (e) {
+    /* package.json not exported - not important */
+  }
+  if (config.server.version) {
+    const proto = botProtocolVersion();
+    if (!proto) {
+      addLog(
+        `[Startup] ERROR: the installed minecraft-data does not know Minecraft ${config.server.version}. Delete node_modules + package-lock.json and run "npm install" again.`,
+      );
+    } else {
+      addLog(`[Startup] Bot will join as Minecraft ${config.server.version} (protocol ${proto})`);
+    }
+  }
+  if (String(config.server.ip).toLowerCase() === "solocloud.site") {
+    addLog(
+      "[Startup] WARNING: server.ip is still 'solocloud.site' (the template's default). Put YOUR server address in settings.json.",
+    );
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(String(config.server.ip))) {
+    addLog(
+      "[Startup] NOTE: server.ip is a raw IP. Aternos needs the hostname (like name.aternos.me), not an IP address.",
+    );
+  }
+}
+
+async function preflightCheck() {
+  runStartupChecks();
+  if (config.server["status-check"] === false) return { ok: true };
+
+  const host = config.server.ip;
+  const port = Number(config.server.port) || 25565;
+
+  let status;
+  try {
+    status = await pingServer(host, port, 8000);
+  } catch (err) {
+    preflightFailures++;
+    addLog(
+      `[Preflight] Cannot reach ${host}:${port} - ${err.message} (try ${preflightFailures}/3). Check server.ip / server.port in settings.json and that the server is running.`,
+    );
+    if (preflightFailures < 3) return { ok: false, retryMs: 20000 };
+    addLog("[Preflight] Status ping keeps failing - trying a normal join anyway.");
+    return { ok: true };
+  }
+
+  preflightFailures = 0;
+  const info = describeStatus(status);
+
+  if (info.notReady) {
+    if (preflightNotReadyCount++ % 5 === 0) {
+      addLog(
+        `[Preflight] Server is NOT online: status says "${info.versionName}"${info.motd ? ` (MOTD: ${info.motd})` : ""}. Start it from your Aternos dashboard - a bot cannot start it. Re-checking every 30s.`,
+      );
+    }
+    return { ok: false, retryMs: 30000 };
+  }
+  preflightNotReadyCount = 0;
+
+  addLog(
+    `[Preflight] Server is online: "${info.versionName}" (protocol ${info.protocol}), players ${info.online}/${info.max}${info.motd ? `, MOTD: ${info.motd}` : ""}`,
+  );
+  const mine = botProtocolVersion();
+  if (mine && info.protocol && info.protocol > 0 && info.protocol !== mine) {
+    addLog(
+      `[Preflight] WARNING: server protocol ${info.protocol} does not match the bot (${config.server.version} = ${mine}). The join will fail unless the server runs ${config.server.version} or has ViaVersion installed. Fix: set the server to ${config.server.version}.`,
+    );
+  }
+  return { ok: true };
+}
+
+function kickText(reason) {
+  try {
+    const parsed = typeof reason === "string" ? JSON.parse(reason) : reason;
+    const t = chatToText(parsed);
+    if (t) return t;
+  } catch (e) {
+    /* not JSON */
+  }
+  return typeof reason === "object" ? JSON.stringify(reason) : String(reason);
+}
+
+async function createBot() {
   if (!botRunning) {
     addLog("[Bot] Bot is stopped - not creating a new instance.");
     return;
@@ -1207,7 +1330,30 @@ function createBot() {
     addLog("[Bot] Already reconnecting, skipping...");
     return;
   }
+  if (preflightInProgress) return;
 
+  preflightInProgress = true;
+  let verdict = { ok: true };
+  try {
+    verdict = await preflightCheck();
+  } catch (e) {
+    addLog("[Preflight] Check failed unexpectedly:", e.message);
+  } finally {
+    preflightInProgress = false;
+  }
+
+  if (!botRunning) return; // user pressed Stop while we were checking
+  if (!verdict.ok) {
+    preflightRetryId = setTimeout(() => {
+      preflightRetryId = null;
+      createBot();
+    }, verdict.retryMs || 30000);
+    return;
+  }
+  startBot();
+}
+
+function startBot() {
   // Cleanup previous bot properly to avoid ghost bots
   if (bot) {
     clearAllIntervals();
@@ -1243,11 +1389,60 @@ function createBot() {
 
     bot.loadPlugin(pathfinder);
 
+    // ---- connection diagnostics: show exactly how far the join got ----
+    const connectStartedAt = Date.now();
+    let lastPacketName = "none yet";
+    let socketConnected = false;
+    const clientState = () => {
+      try {
+        return bot && bot._client ? bot._client.state : "unknown";
+      } catch (e) {
+        return "unknown";
+      }
+    };
+    try {
+      const client = bot._client;
+      client.once("connect", () => {
+        socketConnected = true;
+        addLog("[Bot] TCP connection established - logging in...");
+      });
+      client.on("state", (newState, oldState) =>
+        addLog(`[Bot] Protocol state: ${oldState} -> ${newState}`),
+      );
+      client.on("packet", (data, meta) => {
+        if (!botState.connected && meta) lastPacketName = `${meta.state}/${meta.name}`;
+      });
+      bot.once("login", () => addLog("[Bot] Login accepted by server - waiting for spawn..."));
+    } catch (e) {
+      addLog("[Bot] (diagnostics unavailable:", e.message + ")");
+    }
+
     // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
     clearBotTimeouts();
+    connectionHeartbeatId = setInterval(() => {
+      if (botState.connected) return;
+      const waited = Math.round((Date.now() - connectStartedAt) / 1000);
+      addLog(
+        `[Bot] Still waiting for spawn... ${waited}s (state: ${clientState()}, last packet: ${lastPacketName})`,
+      );
+    }, 20000);
     connectionTimeoutId = setTimeout(() => {
       if (!botState.connected) {
-        addLog("[Bot] Connection timeout - no spawn received");
+        const st = clientState();
+        addLog(
+          `[Bot] Connection timeout - no spawn received (state: ${st}, last packet: ${lastPacketName})`,
+        );
+        let hint;
+        if (!socketConnected) {
+          hint = "The TCP connection never opened: wrong server.ip/server.port, or your host blocks outbound Minecraft connections.";
+        } else if (st === "login" || st === "handshaking") {
+          hint = "Connected but the server never finished the login: server still starting/full, a proxy holding the connection, or an auth/whitelist plugin.";
+        } else if (st === "configuration") {
+          hint = "Stuck in the configuration phase: usually a bot-library/server version mismatch. Reinstall dependencies (npm install) and make sure the server really runs " + config.server.version + ".";
+        } else {
+          hint = "Joined but never got the spawn packet: look for 'Error' lines above (packet decode errors mean the libraries don't fully support this version yet).";
+        }
+        addLog(`[Bot] Hint: ${hint}`);
         try {
           bot.removeAllListeners();
           bot.end();
@@ -1318,8 +1513,7 @@ function createBot() {
     // so that 'end' is the single source of reconnect truth, preventing double-trigger.
     bot.on("kicked", (reason) => {
       // FIX: stringify reason if it's an object to make it readable in logs
-      const kickReason =
-        typeof reason === "object" ? JSON.stringify(reason) : reason;
+      const kickReason = kickText(reason);
       addLog(`[Bot] Kicked: ${kickReason}`);
       botState.connected = false;
       botState.errors.push({

@@ -6,10 +6,11 @@
     "type": "offline"
   },
   "server": {
-    "ip": "carbonated.aternos.me",
-    "port": 30928,
+    "ip": "solocloud.site",
+    "port": 25565,
     "version": "26.1.2",
-    "try-creative": false
+    "try-creative": false,
+    "status-check": true
   },
   "position": {
     "enabled": true,
